@@ -27,6 +27,13 @@ import random
 import argparse
 from dataclasses import dataclass, asdict
 from typing import Dict, Tuple, Optional
+import os
+
+# --- hard reset torch logging state (prevents dict corruption) ---
+for k in list(os.environ.keys()):
+    if k.startswith("TORCH_"):
+        if "LOG" in k or "DYNAMO" in k or "INDUCTOR" in k:
+            os.environ.pop(k, None)
 
 import torch
 import torch.nn as nn
