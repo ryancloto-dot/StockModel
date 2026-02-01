@@ -10,6 +10,14 @@
 # Works on Windows WITHOUT Triton (torch.compile auto-disables if Triton missing).
 # Intended for Linux + L40S/A100 too.
 # ------------------------------------------------------------
+import os
+
+# ---- TorchInductor / Triton cleanup ----
+os.environ["TORCH_LOGS"] = ""
+os.environ["TORCHDYNAMO_DISABLE"] = "0"
+os.environ["TORCHINDUCTOR_VERBOSE"] = "0"
+os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/workspace/torchinductor_cache"
 
 import os
 import json
@@ -173,18 +181,25 @@ def maybe_enable_perf(cfg: Config, device: torch.device):
 def maybe_compile(cfg: Config, module: nn.Module) -> nn.Module:
     if not cfg.compile:
         return module
-    # torch.compile on Windows often fails due to Triton / toolchain constraints.
-    # We'll try, and if it fails, fall back to eager without crashing the run.
+
     try:
         import triton  # noqa: F401
     except Exception:
-        print("[compile] Triton not available -> disabling torch.compile (safe fallback).")
+        print("[compile] Triton not available -> disabling torch.compile.")
         return module
 
     try:
+        import torch
         import torch._dynamo
+
         torch._dynamo.config.suppress_errors = True
-        return torch.compile(module, mode="max-autotune")
+
+        torch._inductor.config.max_autotune = False
+        torch._inductor.config.triton.autotune = False
+        torch._inductor.config.triton.cudagraphs = True
+
+        return torch.compile(module, mode="reduce-overhead")
+
     except Exception as e:
         print(f"[compile] torch.compile failed -> fallback to eager. Reason: {e}")
         return module
@@ -1164,6 +1179,22 @@ def main():
         print(f"  action_day: {act_name}")
         print(f"  returns[:5]: {out['returns'][0,:5].detach().cpu().tolist()}")
         print(f"  p_slow: {p_slow[0].item():.3f}")
+        import subprocess
+        from datetime import datetime
+
+        def git_backup_checkpoints(out_dir):
+            try:
+                subprocess.run(["git", "add", out_dir], check=True)
+                subprocess.run(["git", "add", ".gitattributes"], check=True)
+
+                msg = f"backup checkpoints {datetime.utcnow().isoformat()}Z"
+                subprocess.run(["git", "commit", "-m", msg], check=True)
+                subprocess.run(["git", "push"], check=True)
+
+                print("[backup] checkpoints pushed to GitHub")
+            except Exception as e:
+                print(f"[backup] Git push failed: {e}")
+
 
 if __name__ == "__main__":
     main()
