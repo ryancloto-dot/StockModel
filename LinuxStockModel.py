@@ -1057,17 +1057,42 @@ def args_to_cfg(args) -> Config:
     return cfg
 
 def main():
+    import subprocess
+    from datetime import datetime
+
+    def git_backup_checkpoints(out_dir: str):
+        try:
+            subprocess.run(["git", "add", out_dir], check=True)
+            subprocess.run(["git", "add", ".gitattributes"], check=True)
+
+            msg = f"backup checkpoints {datetime.utcnow().isoformat()}Z"
+            subprocess.run(["git", "commit", "-m", msg], check=True)
+            subprocess.run(["git", "push"], check=True)
+
+            print("[backup] checkpoints pushed to GitHub")
+        except subprocess.CalledProcessError as e:
+            print(f"[backup] Git command failed: {e}")
+        except Exception as e:
+            print(f"[backup] Unexpected error: {e}")
+
+    # ----------------------------
+    # Setup
+    # ----------------------------
     args = build_argparser().parse_args()
     cfg = args_to_cfg(args)
 
     set_seed(cfg.seed)
 
-    device = torch.device(cfg.device if torch.cuda.is_available() or cfg.device == "cpu" else "cpu")
+    device = torch.device(
+        cfg.device if (cfg.device == "cpu" or torch.cuda.is_available()) else "cpu"
+    )
     cfg.device = str(device)
 
     maybe_enable_perf(cfg, device)
 
-    print("[note] Windows detected. If DataLoader hangs, set --num_workers 0.") if os.name == "nt" else None
+    if os.name == "nt":
+        print("[note] Windows detected. If DataLoader hangs, use --num_workers 0")
+
     print("Config:", json.dumps(asdict(cfg), indent=2))
     print("Device:", device)
 
@@ -1075,132 +1100,105 @@ def main():
 
     model = CognitiveStockModel(cfg).to(device)
 
-    # optionally compile submodules
+    # ----------------------------
+    # Optional compilation
+    # ----------------------------
     if cfg.compile:
-        print("[compile] torch.compile enabled for modules (will auto-fallback if Triton missing)")
+        print("[compile] torch.compile enabled (auto-fallback if Triton missing)")
         model.agents = maybe_compile(cfg, model.agents)
         model.fast = maybe_compile(cfg, model.fast)
         model.medium = maybe_compile(cfg, model.medium)
         model.slow = maybe_compile(cfg, model.slow)
 
-    # load resumes if provided
+    # ----------------------------
+    # Resume checkpoints (optional)
+    # ----------------------------
     if cfg.resume_agents:
-        model.agents.load_state_dict(_try_load_state_dict(cfg.resume_agents, map_location="cpu"))
+        model.agents.load_state_dict(_try_load_state_dict(cfg.resume_agents))
     if cfg.resume_fast:
-        model.fast.load_state_dict(_try_load_state_dict(cfg.resume_fast, map_location="cpu"))
+        model.fast.load_state_dict(_try_load_state_dict(cfg.resume_fast))
     if cfg.resume_medium:
-        model.medium.load_state_dict(_try_load_state_dict(cfg.resume_medium, map_location="cpu"))
+        model.medium.load_state_dict(_try_load_state_dict(cfg.resume_medium))
     if cfg.resume_slow:
-        model.slow.load_state_dict(_try_load_state_dict(cfg.resume_slow, map_location="cpu"))
+        model.slow.load_state_dict(_try_load_state_dict(cfg.resume_slow))
 
-    # params
+    # ----------------------------
+    # Params
+    # ----------------------------
     p_agents = count_params(model.agents)
     p_fast = count_params(model.fast)
     p_medium = count_params(model.medium)
     p_slow = count_params(model.slow)
-    print(f"[params] agents={human_m(p_agents)} fast={human_m(p_fast)} medium={human_m(p_medium)} slow={human_m(p_slow)} total={human_m(p_agents+p_fast+p_medium+p_slow)}")
+
+    print(
+        f"[params] agents={human_m(p_agents)} "
+        f"fast={human_m(p_fast)} "
+        f"medium={human_m(p_medium)} "
+        f"slow={human_m(p_slow)} "
+        f"total={human_m(p_agents+p_fast+p_medium+p_slow)}"
+    )
 
     os.makedirs(cfg.out_dir, exist_ok=True)
 
-    # ----------------------------
-    # STAGE 0: Agents
-    # ----------------------------
-    print("=== STAGE 0: TRAIN AGENTS (FakeWeb -> latent evidence) ===")
+    # ============================================================
+    # STAGE 0 — AGENTS
+    # ============================================================
+    print("=== STAGE 0: TRAIN AGENTS ===")
     model.train()
     train_agents(cfg, model, train_dl, device)
-    save_state_dict(os.path.join(cfg.out_dir, "agents_frozen.pt"), model.agents)
-    print(f"[save] {os.path.join(cfg.out_dir, 'agents_frozen.pt')}")
 
-    # ----------------------------
-    # STAGE 1: Fast
-    # ----------------------------
-    print("=== STAGE 1: TRAIN FAST (always-on) ===")
-    model.train()
-    # freeze agents for speed
+    save_state_dict(os.path.join(cfg.out_dir, "agents_frozen.pt"), model.agents)
+    print("[save] agents_frozen.pt")
+    git_backup_checkpoints(cfg.out_dir)
+
+    # ============================================================
+    # STAGE 1 — FAST
+    # ============================================================
+    print("=== STAGE 1: TRAIN FAST ===")
     for p in model.agents.parameters():
         p.requires_grad = False
-    train_fast(cfg, model, train_dl, val_dl, device)
-    save_state_dict(os.path.join(cfg.out_dir, "fast_frozen.pt"), model.fast)
-    print(f"[save] {os.path.join(cfg.out_dir, 'fast_frozen.pt')}")
 
-    # ----------------------------
-    # STAGE 2: Medium (epistemic gate)
-    # ----------------------------
-    print("=== STAGE 2: TRAIN MEDIUM (gate) ===")
     model.train()
-    # freeze fast too
+    train_fast(cfg, model, train_dl, val_dl, device)
+
+    save_state_dict(os.path.join(cfg.out_dir, "fast_frozen.pt"), model.fast)
+    print("[save] fast_frozen.pt")
+    git_backup_checkpoints(cfg.out_dir)
+
+    # ============================================================
+    # STAGE 2 — MEDIUM
+    # ============================================================
+    print("=== STAGE 2: TRAIN MEDIUM ===")
     for p in model.fast.parameters():
         p.requires_grad = False
     for p in model.medium.parameters():
         p.requires_grad = True
-    train_medium(cfg, model, train_dl, val_dl, device)
-    save_state_dict(os.path.join(cfg.out_dir, "medium_frozen.pt"), model.medium)
-    print(f"[save] {os.path.join(cfg.out_dir, 'medium_frozen.pt')}")
 
-    # ----------------------------
-    # STAGE 3: Slow (corrective)
-    # ----------------------------
+    model.train()
+    train_medium(cfg, model, train_dl, val_dl, device)
+
+    save_state_dict(os.path.join(cfg.out_dir, "medium_frozen.pt"), model.medium)
+    print("[save] medium_frozen.pt")
+    git_backup_checkpoints(cfg.out_dir)
+
+    # ============================================================
+    # STAGE 3 — SLOW
+    # ============================================================
     if cfg.slow_epochs > 0:
-        print("=== STAGE 3: TRAIN SLOW (rare, expensive) ===")
-        model.train()
+        print("=== STAGE 3: TRAIN SLOW ===")
         for p in model.slow.parameters():
             p.requires_grad = True
+
+        model.train()
         train_slow(cfg, model, train_dl, val_dl, device)
+
         save_state_dict(os.path.join(cfg.out_dir, "slow_final.pt"), model.slow)
-        print(f"[save] {os.path.join(cfg.out_dir, 'slow_final.pt')}")
+        print("[save] slow_final.pt")
+        git_backup_checkpoints(cfg.out_dir)
     else:
-        print("=== STAGE 3: SKIPPED (slow_epochs=0) ===")
+        print("=== STAGE 3: SKIPPED ===")
 
-    print(f"[save] wrote full stage set -> {cfg.out_dir}")
-
-    # quick sample pred
-    with torch.no_grad():
-        batch = next(iter(val_dl))
-        x_price = batch["x_price"]
-        web = batch["web"]
-        # compute fast
-        z_all, _ = model.agents(web)
-        agent_mean = z_all.mean(dim=1)
-        agent_var = CognitiveStockModel.agent_disagreement(z_all)
-        out_fast = model.fast(x_price)
-        ent_fast = CognitiveStockModel.fast_day_entropy(out_fast["logits_day"])
-        fa_dis = CognitiveStockModel.fast_agent_disagreement(out_fast["fast_summary"], agent_mean)
-        stats6 = CognitiveStockModel.stats_from_price(x_price)
-        stats = torch.cat([stats6, ent_fast.unsqueeze(-1), agent_var.unsqueeze(-1), fa_dis.unsqueeze(-1)], dim=-1)
-        gate = model.medium(out_fast["fast_summary"], agent_mean, stats)
-        p_slow = gate["p_slow"]
-
-        # choose slow or fast for demo
-        use_slow = (p_slow[0].item() >= cfg.slow_threshold) and (cfg.slow_epochs > 0)
-        if use_slow:
-            out = model.slow(out_fast["fast_summary"][:1])
-            src = "SLOW"
-        else:
-            out = {k: v[:1] for k, v in out_fast.items() if k in ["returns", "logits_day", "logits_sum"]}
-            src = "FAST"
-
-        act = torch.argmax(out["logits_day"], dim=-1).item()
-        act_name = ["SELL", "HOLD", "BUY"][act]
-        print("\nSAMPLE PRED:")
-        print(f"  src: {src}")
-        print(f"  action_day: {act_name}")
-        print(f"  returns[:5]: {out['returns'][0,:5].detach().cpu().tolist()}")
-        print(f"  p_slow: {p_slow[0].item():.3f}")
-        import subprocess
-        from datetime import datetime
-
-        def git_backup_checkpoints(out_dir):
-            try:
-                subprocess.run(["git", "add", out_dir], check=True)
-                subprocess.run(["git", "add", ".gitattributes"], check=True)
-
-                msg = f"backup checkpoints {datetime.utcnow().isoformat()}Z"
-                subprocess.run(["git", "commit", "-m", msg], check=True)
-                subprocess.run(["git", "push"], check=True)
-
-                print("[backup] checkpoints pushed to GitHub")
-            except Exception as e:
-                print(f"[backup] Git push failed: {e}")
+    print(f"[done] all checkpoints saved to {cfg.out_dir}")
 
 
 if __name__ == "__main__":
