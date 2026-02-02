@@ -1199,6 +1199,23 @@ def main():
         print("=== STAGE 3: SKIPPED ===")
 
     print(f"[done] all checkpoints saved to {cfg.out_dir}")
+    import subprocess
+    import threading
+    import time
+    import os
+    
+    def serve_for_download(path="/workspace", port=8000):
+        os.chdir(path)
+        print(f"[download] Serving {path} on http://0.0.0.0:{port}")
+        subprocess.run(["python3", "-m", "http.server", str(port)])
+    
+    # start server in background
+    threading.Thread(target=serve_for_download, daemon=True).start()
+    
+    # keep process alive so you can download
+    print("[download] Waiting for manual download. Press Ctrl+C when done.")
+    while True:
+        time.sleep(3600)
 
 
 if __name__ == "__main__":
