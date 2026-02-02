@@ -1199,6 +1199,10 @@ def main():
         print("=== STAGE 3: SKIPPED ===")
 
     print(f"[done] all checkpoints saved to {cfg.out_dir}")
+
+
+if __name__ == "__main__":
+    main()
     import subprocess
     import threading
     import time
@@ -1217,6 +1221,3 @@ def main():
     while True:
         time.sleep(3600)
 
-
-if __name__ == "__main__":
-    main()
